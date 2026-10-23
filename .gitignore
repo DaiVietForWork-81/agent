@@ -1,0 +1,19 @@
+node_modules/
+dist/
+data/
+*.log
+.env
+.DS_Store
+
+# personal / unrelated
+_build/
+_img/
+_extract_pdf.py
+_find.py
+build_decuong.py
+
+# UI layer (desktop/web) - khong push vao repo agent
+public/
+electron/
+.agents/
+skills-lock.json
