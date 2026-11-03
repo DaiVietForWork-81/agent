@@ -8,6 +8,7 @@ export interface MockServerOptions {
   failChatForModels?: string[];
   rateLimitOnce?: boolean;
   stream?: boolean;
+  resetOnce?: boolean; // simulate ECONNRESET: destroy socket on first chat request
 }
 
 export interface MockServer {
@@ -42,6 +43,11 @@ export async function startMockOpenAI(opts: MockServerOptions = {}): Promise<Moc
       }
 
       if (req.url?.includes('/chat/completions')) {
+        if (opts.resetOnce && !rateLimited) {
+          rateLimited = true; // raw socket destroy, no response — client sees ECONNRESET
+          res.socket?.destroy();
+          return;
+        }
         if (auth !== `Bearer ${validKey}`) {
           res.writeHead(401, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: { message: 'invalid api key' } }));

@@ -98,6 +98,34 @@ export interface ProviderAdapter {
   chatStream(cred: Credential, modelId: string, opts: ChatOptions): AsyncIterable<ChatChunk>;
 }
 
+/** Retry transient provider failures (ECONNRESET/timeout/429/5xx) with exponential backoff.
+ *  Non-retryable kinds (auth, not_found, bad_request) fail immediately. */
+export async function withRetry<T>(
+  fn: (attempt: number) => Promise<T>,
+  opts: { retries?: number; baseMs?: number; signal?: AbortSignal; onRetry?: (attempt: number, err: ProviderError) => void } = {},
+): Promise<T> {
+  const retries = opts.retries ?? 2;
+  const baseMs = opts.baseMs ?? 800;
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await fn(attempt);
+    } catch (e) {
+      const pe = e instanceof ProviderError ? e : null;
+      const transientNonProvider = e instanceof Error && /terminated|ECONNRESET|EPIPE|fetch failed|socket|aborted.*reset/i.test(e.message);
+      const retryable = (pe?.retryable === true) || transientNonProvider;
+      if (attempt >= retries || !retryable || opts.signal?.aborted) throw e;
+      const delay = baseMs * Math.pow(2, attempt) + Math.floor(Math.random() * 300);
+      opts.onRetry?.(attempt + 1, pe ?? new ProviderError('network', (e as Error).message));
+      await new Promise<void>((resolve, reject) => {
+        const t = setTimeout(resolve, delay);
+        opts.signal?.addEventListener('abort', () => { clearTimeout(t); reject(new Error('aborted')); }, { once: true });
+      });
+      attempt++;
+    }
+  }
+}
+
 // ---------- OpenAI-compatible adapter (covers OpenAI, NVIDIA NIM, DeepSeek, Groq, Together, OpenRouter, Ollama, LM Studio, vLLM, ...) ----------
 
 interface OAChatResponse {
@@ -153,8 +181,10 @@ export class OpenAICompatAdapter implements ProviderAdapter {
     if (opts.tools?.length) {
       body.tools = opts.tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters } }));
     }
-    const res = await this.post(cred, '/chat/completions', body, opts);
-    const data = (await res.json()) as OAChatResponse;
+    const data = await withRetry(async () => {
+      const res = await this.post(cred, '/chat/completions', body, opts);
+      return (await res.json()) as OAChatResponse;
+    }, { retries: 2, baseMs: 800, signal: opts.signal });
     const choice = data.choices?.[0];
     const msg = choice?.message;
     return {
@@ -177,8 +207,11 @@ export class OpenAICompatAdapter implements ProviderAdapter {
     if (opts.tools?.length) {
       body.tools = opts.tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters } }));
     }
-    const res = await this.post(cred, '/chat/completions', body, opts);
-    if (!res.body) throw new ProviderError('upstream', 'empty stream body');
+    const res = await withRetry(async () => {
+      const r = await this.post(cred, '/chat/completions', body, opts);
+      if (!r.body) throw new ProviderError('upstream', 'empty stream body');
+      return r as Response & { body: NonNullable<Response['body']> };
+    }, { retries: 2, baseMs: 800, signal: opts.signal });
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
@@ -354,29 +387,31 @@ export class AnthropicAdapter implements ProviderAdapter {
     if (opts.tools?.length) {
       body.tools = opts.tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }));
     }
-    let res: Response;
-    try {
-      res = await withTimeout(
-        (signal) => fetch(this.joinUrl(cred.baseUrl, '/v1/messages'), {
-          method: 'POST',
-          headers: this.headers(cred),
-          body: JSON.stringify(body),
-          signal,
-        }),
-        opts.timeoutMs ?? 120_000,
-        opts.signal,
-      );
-    } catch (e) {
-      if (e instanceof TimeoutError || (e instanceof Error && e.name === 'AbortError')) {
-        throw new ProviderError('timeout', `request timed out: ${(e as Error).message}`);
+    const data = await withRetry(async () => {
+      let res: Response;
+      try {
+        res = await withTimeout(
+          (signal) => fetch(this.joinUrl(cred.baseUrl, '/v1/messages'), {
+            method: 'POST',
+            headers: this.headers(cred),
+            body: JSON.stringify(body),
+            signal,
+          }),
+          opts.timeoutMs ?? 120_000,
+          opts.signal,
+        );
+      } catch (e) {
+        if (e instanceof TimeoutError || (e instanceof Error && e.name === 'AbortError')) {
+          throw new ProviderError('timeout', `request timed out: ${(e as Error).message}`);
+        }
+        throw new ProviderError('network', `network error: ${(e as Error).message}`);
       }
-      throw new ProviderError('network', `network error: ${(e as Error).message}`);
-    }
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw normalizeHttpError(res.status, text, modelId);
-    }
-    const data = (await res.json()) as AnthropicResponse;
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw normalizeHttpError(res.status, text, modelId);
+      }
+      return (await res.json()) as AnthropicResponse;
+    }, { retries: 2, baseMs: 800, signal: opts.signal });
     let text = '';
     const toolCalls: ToolCall[] = [];
     for (const block of data.content ?? []) {

@@ -75,11 +75,10 @@ describe('OpenAI-compatible adapter', () => {
       .rejects.toMatchObject({ kind: 'auth' });
 
     const m2 = await make({ rateLimitOnce: true });
-    await expect(a.chat(cred(m2.baseUrl), 'mock-model-1', { messages: [{ role: 'user', content: 'x' }] }))
-      .rejects.toMatchObject({ kind: 'rate_limit' });
-    // second attempt succeeds (rate limit was once)
+    // retry-once policy: first attempt hits 429, adapter backs off and succeeds on attempt 2
     const res = await a.chat(cred(m2.baseUrl), 'mock-model-1', { messages: [{ role: 'user', content: 'x' }] });
     expect(res.text).toBe('Hello from mock');
+    expect(m2.requests.filter((r) => r.path.includes('/chat/completions')).length).toBe(2);
   });
 
   it('never includes the api key in thrown error messages', async () => {
